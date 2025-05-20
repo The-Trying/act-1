@@ -64,6 +64,12 @@ def get_args_parser():
     parser.add_argument('--chunk_size', action='store', type=int, help='chunk_size', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
 
+    # add new arg for point encoder dim if desired
+    parser.add_argument('--point_hidden_dim', default=64, type=int,
+                        help="Hidden dim for per-point MLP")
+    parser.add_argument('--point_out_dim', default=128, type=int,
+                        help="Output dim for point cloud encoding")
+
     return parser
 
 

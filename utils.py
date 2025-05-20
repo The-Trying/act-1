@@ -40,6 +40,13 @@ class EpisodicDataset(torch.utils.data.Dataset):
             image_dict = dict()
             for cam_name in self.camera_names:
                 image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+            # 5个3D点
+            points = []
+            for i in range(1, 6):
+                # 每个point{i} 存储形状（T，3）， 我们只取当前帧
+                pt = root[f'/point{i}'][start_ts]
+                points.append(pt)
+            points = np.stack(points, axis=0)
             # get all actions after and including start_ts
             if is_sim:
                 # action = root['/action'][start_ts:]
@@ -54,8 +61,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
         padded_action = np.zeros(original_action_shape, dtype=np.float32)
         padded_action[:action_len] = action
         is_pad = np.zeros(episode_len)
-        is_pad[action_len:] = 1
+        is_pad[action_len:] = 1   # 相当于ture
 
+        # 1）图像
         # new axis for different cameras
         all_cam_images = []
         for cam_name in self.camera_names:
@@ -64,34 +72,48 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         # construct observations
         image_data = torch.from_numpy(all_cam_images)
-        qpos_data = torch.from_numpy(qpos).float()
-        action_data = torch.from_numpy(padded_action).float()
-        is_pad = torch.from_numpy(is_pad).bool()
-
         # channel last
         image_data = torch.einsum('k h w c -> k c h w', image_data)
-
         # normalize image and change dtype to float
         image_data = image_data / 255.0
-        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+
+        # 2）qpos （4，）
+        qpos_data = torch.from_numpy(qpos).float()
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
-        return image_data, qpos_data, action_data, is_pad
+        # 3）points （5,3）
+        points_data = torch.from_numpy(points).float()
+        points_data = (points_data - self.norm_stats['points_mean']) / self.norm_stats['points_std']
+
+        # 4）action
+        action_data = torch.from_numpy(padded_action).float()
+        action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
+        is_pad = torch.from_numpy(is_pad).bool()
+        return image_data, qpos_data, points_data, action_data, is_pad
 
 
 def get_norm_stats(dataset_dir, num_episodes):
     all_qpos_data = []
     all_action_data = []
+    all_points_data = []
     for episode_idx in range(num_episodes):
         dataset_path = os.path.join(dataset_dir, f'episode_{episode_idx}.hdf5')
         with h5py.File(dataset_path, 'r') as root:
+            # 全序列读取
             qpos = root['/action'][()]
             # qvel = root['/observations/qvel'][()]
             action = root['/action'][()]
+            # 5个点
+            pts = []
+            for i in range(1, 6):
+                pts.append(root[f'/point{i}'][()]) # (T,3)
+            pts = np.stack(pts, axis=1)
         all_qpos_data.append(torch.from_numpy(qpos))
         all_action_data.append(torch.from_numpy(action))
+        all_points_data.append(torch.form_numpy(pts).view(-1, 3)) # 展平为 (T*5, 3)
     all_qpos_data = torch.stack(all_qpos_data)
     all_action_data = torch.stack(all_action_data)
+    all_points_data = torch.stack(all_points_data)
     all_action_data = all_action_data
 
     # normalize action data
@@ -104,8 +126,14 @@ def get_norm_stats(dataset_dir, num_episodes):
     qpos_std = all_qpos_data.std(dim=[0, 1], keepdim=True)
     qpos_std = torch.clip(qpos_std, 1e-2, np.inf) # clipping
 
+    # normalize point data
+    points_mean = all_points_data.mean(dim=[0, 1], keepdim=True)
+    points_std = all_points_data.std(dim=[0, 1], keepdim=True)
+    points_std = torch.clip(points_std, 1e-2, np.inf) # clipping
+
     stats = {"action_mean": action_mean.numpy().squeeze(), "action_std": action_std.numpy().squeeze(),
              "qpos_mean": qpos_mean.numpy().squeeze(), "qpos_std": qpos_std.numpy().squeeze(),
+             "points_mean": points_mean.numpy().squeeze(), "points_std": points_std.numpy().squeeze(),
              "example_qpos": qpos}
 
     return stats

@@ -30,6 +30,12 @@ SIM_TASK_CONFIGS = {
         'episode_len': 500,
         'camera_names': ['top']
     },
+    'sim_excavator_unloading': {
+        'dataset_dir': DATA_DIR + '/sim_excavator_unloading',
+        'num_episodes': 50, # 这里的50是用来生成或训练 训练集的时候，指定50组数据
+        'episode_len': 400, # 数据集的长度，当前模型需要固定数据集的长度
+        'camera_names': ['top']
+    },
 }
 
 ### Simulation envs fixed constants

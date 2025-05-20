@@ -47,7 +47,7 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # fixed parameters
-    state_dim = 19
+    state_dim = 4  # 状态量只有4个，分别为四个关节的角度
     lr_backbone = 1e-5
     backbone = 'resnet18'
     if policy_class == 'ACT':
@@ -314,9 +314,9 @@ def eval_bc(config, ckpt_name, save_episode=True):
 
 
 def forward_pass(data, policy):
-    image_data, qpos_data, action_data, is_pad = data
-    image_data, qpos_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), action_data.cuda(), is_pad.cuda()
-    return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
+    image_data, qpos_data, points_data, action_data, is_pad = data
+    image_data, qpos_data, points_data, action_data, is_pad = image_data.cuda(), qpos_data.cuda(), points_data.cuda(), action_data.cuda(), is_pad.cuda()
+    return policy(qpos_data, image_data, points_data, action_data, is_pad) # TODO remove None
 
 
 def train_bc(train_dataloader, val_dataloader, config):
@@ -432,5 +432,11 @@ if __name__ == '__main__':
     parser.add_argument('--hidden_dim', action='store', type=int, help='hidden_dim', required=False)
     parser.add_argument('--dim_feedforward', action='store', type=int, help='dim_feedforward', required=False)
     parser.add_argument('--temporal_agg', action='store_true')
+
+    # add new arg for point encoder dim if desired
+    parser.add_argument('--point_hidden_dim', default=64, type=int,
+                        help="Hidden dim for per-point MLP")
+    parser.add_argument('--point_out_dim', default=128, type=int,
+                        help="Output dim for point cloud encoding")
     
     main(vars(parser.parse_args()))

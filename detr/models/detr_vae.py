@@ -30,10 +30,23 @@ def get_sinusoid_encoding_table(n_position, d_hid):
 
     return torch.FloatTensor(sinusoid_table).unsqueeze(0)
 
+# 小怪兽添加
+class PointCloudEncoder(nn.Module):
+    def __init__(self, in_dim=3, hidden_dim=64, out_dim=128):
+        super().__init__()
+        self.mlp1 = nn.Linear(in_dim, hidden_dim)
+        self.mlp2 = nn.Linear(hidden_dim, hidden_dim)
+        self.post_fc = nn.Linear(hidden_dim, out_dim)
 
+    def forward(self, pts):
+        B, N, _ = pts.shape
+        x = torch.relu(self.mlp1(pts))  # (B, N, hidden_dim)
+        x = torch.relu(self.mlp2(x))    # (B, N, hidden_dim)
+        x_pool, _ = x.max(dim=1)        # (B, hidden_dim)
+        return torch.relu(self.post_fc(x_pool))  # (B, out_dim)
 class DETRVAE(nn.Module):
     """ This is the DETR module that performs object detection """
-    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names):
+    def __init__(self, backbones, transformer, encoder, state_dim, num_queries, camera_names, point_hidden_dim, point_out_dim):
         """ Initializes the model.
         Parameters:
             backbones: torch module of the backbone to be used. See backbone.py
@@ -49,25 +62,32 @@ class DETRVAE(nn.Module):
         self.transformer = transformer
         self.encoder = encoder
         hidden_dim = transformer.d_model
+        # point cloud encoder
+        self.point_encoder = PointCloudEncoder(
+            in_dim=3,
+            hidden_dim=point_hidden_dim,
+            out_dim=point_out_dim  # pass from args
+        )
         self.action_head = nn.Linear(hidden_dim, state_dim)
         self.is_pad_head = nn.Linear(hidden_dim, 1)
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         if backbones is not None:
             self.input_proj = nn.Conv2d(backbones[0].num_channels, hidden_dim, kernel_size=1)
             self.backbones = nn.ModuleList(backbones)
-            self.input_proj_robot_state = nn.Linear(19, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(4, hidden_dim)
+            self.input_proj_env_state = nn.linear(point_out_dim, hidden_dim)
         else:
             # input_dim = 14 + 7 # robot_state + env_state
-            self.input_proj_robot_state = nn.Linear(19, hidden_dim)
-            self.input_proj_env_state = nn.Linear(7, hidden_dim)
+            self.input_proj_robot_state = nn.Linear(4, hidden_dim)
+            self.input_proj_env_state = nn.Linear(point_out_dim, hidden_dim)
             self.pos = torch.nn.Embedding(2, hidden_dim)
             self.backbones = None
 
         # encoder extra parameters
         self.latent_dim = 32 # final size of latent z # TODO tune
         self.cls_embed = nn.Embedding(1, hidden_dim) # extra cls token embedding
-        self.encoder_action_proj = nn.Linear(19, hidden_dim) # project action to embedding
-        self.encoder_joint_proj = nn.Linear(19, hidden_dim)  # project qpos to embedding
+        self.encoder_action_proj = nn.Linear(4, hidden_dim) # project action to embedding
+        self.encoder_joint_proj = nn.Linear(4, hidden_dim)  # project qpos to embedding
         self.latent_proj = nn.Linear(hidden_dim, self.latent_dim*2) # project hidden state to latent std, var
         self.register_buffer('pos_table', get_sinusoid_encoding_table(1+1+num_queries, hidden_dim)) # [CLS], qpos, a_seq
 
@@ -79,16 +99,21 @@ class DETRVAE(nn.Module):
         """
         qpos: batch, qpos_dim
         image: batch, num_cam, channel, height, width
-        env_state: None
+        env_state: dict with key 'points': Tensor (B,5,3)
         actions: batch, seq, action_dim
         """
         is_training = actions is not None # train or val
         bs, _ = qpos.shape
+        pts = env_state['points']
+        pt_feat = self.point_encoder(pts)
+        pt_enc = self.input_proj_env_state(pt_feat) # (B, hidden_dim)
         ### Obtain latent z from action sequence
         if is_training:
             # project action sequence to embedding dim, and concat with a CLS token
             action_embed = self.encoder_action_proj(actions) # (bs, seq, hidden_dim)
             qpos_embed = self.encoder_joint_proj(qpos)  # (bs, hidden_dim)
+            # incorporate points into encoder input by summation or concat
+            qpos_embed = qpos_embed + pt_enc
             qpos_embed = torch.unsqueeze(qpos_embed, axis=1)  # (bs, 1, hidden_dim)
             cls_embed = self.cls_embed.weight # (1, hidden_dim)
             cls_embed = torch.unsqueeze(cls_embed, axis=0).repeat(bs, 1, 1) # (bs, 1, hidden_dim)
@@ -125,12 +150,16 @@ class DETRVAE(nn.Module):
                 all_cam_pos.append(pos)
             # proprioception features
             proprio_input = self.input_proj_robot_state(qpos)
+            pt_emb = self.input_proj_env_state(pt_feat)
+            combined_emb = proprio_input + pt_emb
             # fold camera dimension into width dimension
             src = torch.cat(all_cam_features, axis=3)
             pos = torch.cat(all_cam_pos, axis=3)
-            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, proprio_input, self.additional_pos_embed.weight)[0]
+            hs = self.transformer(src, None, self.query_embed.weight, pos, latent_input, combined_emb, self.additional_pos_embed.weight)[0]
         else:
             qpos = self.input_proj_robot_state(qpos)
+            point = self.input_proj_env_state(pt_feat)
+            qpos = qpos + point
             env_state = self.input_proj_env_state(env_state)
             transformer_input = torch.cat([qpos, env_state], axis=1) # seq length = 2
             hs = self.transformer(transformer_input, None, self.query_embed.weight, self.pos.weight)[0]
@@ -166,8 +195,8 @@ class CNNMLP(nn.Module):
                 backbone_down_projs.append(down_proj)
             self.backbone_down_projs = nn.ModuleList(backbone_down_projs)
 
-            mlp_in_dim = 768 * len(backbones) + 19
-            self.mlp = mlp(input_dim=mlp_in_dim, hidden_dim=1024, output_dim=19, hidden_depth=2)
+            mlp_in_dim = 768 * len(backbones) + 4
+            self.mlp = mlp(input_dim=mlp_in_dim, hidden_dim=1024, output_dim4, hidden_depth=2)
         else:
             raise NotImplementedError
 
@@ -227,7 +256,7 @@ def build_encoder(args):
 
 
 def build(args):
-    state_dim = 19 # TODO hardcode
+    state_dim = 4 # TODO hardcode 挖掘机只有4个关节
 
     # From state
     # backbone = None # from state for now, no need for conv nets
@@ -247,6 +276,8 @@ def build(args):
         state_dim=state_dim,
         num_queries=args.num_queries,
         camera_names=args.camera_names,
+        point_hidden_dim=args.point_hidden_dim,
+        point_out_dim=args.point_out_dim
     )
 
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -255,7 +286,7 @@ def build(args):
     return model
 
 def build_cnnmlp(args):
-    state_dim =19 # TODO hardcode
+    state_dim =4 # TODO hardcode
 
     # From state
     # backbone = None # from state for now, no need for conv nets
